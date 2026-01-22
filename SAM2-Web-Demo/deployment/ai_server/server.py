@@ -16,6 +16,12 @@ import numpy as np
 from PIL import Image
 import io
 import uvicorn
+import boto3
+import uuid
+
+# S3 Configuration
+s3_client = boto3.client('s3')
+BUCKET_NAME = "hyuniv-52-s3"
 
 # sam2 임포트 지연실행 (sys.path 적용 후)
 try:
@@ -56,7 +62,15 @@ def load_model():
         traceback.print_exc()
 
 @app.post("/segment")
-async def segment_image(file: UploadFile = File(...)):
+async def segment_image(
+    file: UploadFile = File(...),
+    point_x: int = None,
+    point_y: int = None,
+    box_x1: int = None,
+    box_y1: int = None,
+    box_x2: int = None,
+    box_y2: int = None
+):
     global predictor
     if predictor is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
@@ -70,12 +84,26 @@ async def segment_image(file: UploadFile = File(...)):
         # Inference
         predictor.set_image(image_np)
         h, w = image_np.shape[:2]
-        input_point = np.array([[w // 2, h // 2]])
-        input_label = np.array([1])
+        
+        # Determine Input (Box takes priority over Point)
+        input_box = None
+        input_point = None
+        input_label = None
+
+        if all(v is not None for v in [box_x1, box_y1, box_x2, box_y2]):
+            input_box = np.array([box_x1, box_y1, box_x2, box_y2])
+        elif point_x is not None and point_y is not None:
+            input_point = np.array([[point_x, point_y]])
+            input_label = np.array([1])
+        else:
+            # Default to center point if nothing provided
+            input_point = np.array([[w // 2, h // 2]])
+            input_label = np.array([1])
         
         masks, scores, _ = predictor.predict(
             point_coords=input_point,
             point_labels=input_label,
+            box=input_box,
             multimask_output=False,
         )
 
@@ -86,10 +114,36 @@ async def segment_image(file: UploadFile = File(...)):
         result_pil = image_pil.convert("RGBA")
         result_pil.putalpha(alpha_image)
 
-        # Return as PNG
+        # Return as Pre-signed URL
         buf = io.BytesIO()
         result_pil.save(buf, format="PNG")
-        return Response(content=buf.getvalue(), media_type="image/png")
+        buf.seek(0)
+        
+        # Upload to S3
+        file_name = f"{uuid.uuid4()}.png"
+        s3_client.upload_fileobj(
+            buf, 
+            BUCKET_NAME, 
+            file_name, 
+            ExtraArgs={
+                'ContentType': 'image/png',
+                'ContentDisposition': f'inline; filename="{file_name}"'
+            }
+        )
+        
+        # Generate Pre-signed URL (1 hour validity)
+        presigned_url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={
+                'Bucket': BUCKET_NAME, 
+                'Key': file_name,
+                'ResponseContentDisposition': f'inline; filename="{file_name}"',
+                'ResponseContentType': 'image/png'
+            },
+            ExpiresIn=3600
+        )
+        
+        return {"image_url": presigned_url}
 
     except Exception as e:
         print(f"Error during inference: {e}")
